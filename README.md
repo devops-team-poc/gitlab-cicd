@@ -1,4 +1,4 @@
-<h1> Setting up CICD  Pipeline for React Stub</h1>
+<h1> Setting up CICD  Pipeline on GitLab using EKS</h1>
 
 <h2>PreRequisites:</h2>
 
