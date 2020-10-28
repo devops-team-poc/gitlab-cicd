@@ -1,0 +1,180 @@
+image: 
+  name: gcr.io/kaniko-project/executor:debug
+  entrypoint: [""]
+
+variables:
+  DAST_VERSION: 1
+  SECURE_ANALYZERS_PREFIX: "registry.gitlab.com/gitlab-org/security-products/analyzers"
+
+
+stages:
+  - build
+  - test
+  - deploy-to-dev
+  - dast
+  - deploy-to-test
+  - deploy-to-stage
+  - deploy-to-prod
+  - cleanup
+
+
+build:
+  stage: build
+  only:
+  - master
+  allow_failure: false
+  script:
+    - |
+      echo "RELEASE_FILE= "${RELEASE_FILE}
+      if [ -f "$RELEASE_FILE" ]
+      then
+        echo "CI_PIPELINE_IID= "${CI_PIPELINE_IID}
+        ADDITIONALTAGLIST="$ADDITIONALTAGLIST v$CI_PIPELINE_IID"
+        if [[ "$CI_COMMIT_BRANCH" == "$CI_DEFAULT_BRANCH" ]]; then ADDITIONALTAGLIST="$ADDITIONALTAGLIST latest"; fi
+        if [[ -n "$ADDITIONALTAGLIST" ]]; then
+          for TAG in $ADDITIONALTAGLIST; do
+            FORMATTEDTAGLIST=" --tag $CI_REGISTRY_IMAGE:$TAG ";
+          done;
+        fi
+        #Reformat Docker tags to kaniko's --destination argument:
+        FORMATTEDTAGLIST=$(echo "${FORMATTEDTAGLIST}" | sed s/\-\-tag/\-\-destination/g)
+        mkdir -p /kaniko/.docker
+        echo "{\"auths\":{\"$CI_REGISTRY\":{\"auth\":\"$(echo -n $DOCKER_USER:$DOCKER_PASS | base64)\"}}}" > /kaniko/.docker/config.json
+        /kaniko/executor --context $CI_PROJECT_DIR --dockerfile $CI_PROJECT_DIR/Dockerfile $FORMATTEDTAGLIST
+      else
+        echo "Release file does not exist"
+        exit 125
+      fi
+
+include:
+  - template: Jobs/Test.gitlab-ci.yml 
+  - template: Security/SAST.gitlab-ci.yml
+
+deploy-to-dev:
+  stage: deploy-to-dev
+  image: dtzar/helm-kubectl
+  only:
+    - master
+  environment:
+    name: dev
+  script:
+    - echo 'CI_ENVIRONMENT_NAME =' $CI_ENVIRONMENT_NAME
+    - kubectl config set-cluster k8s --server="${SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${USER_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab
+    - kubectl config use-context default
+    - kubectl create secret docker-registry ${secret_for_accessing_gitlab_registry} --docker-server=${CI_REGISTRY} --docker-username=${DOCKER_USER} --docker-password=${DOCKER_PASS} -n env-${CI_ENVIRONMENT_NAME} || true
+    - sed -i "s/<VERSION>/${CI_PIPELINE_IID}/g" eks-files/deployment.yaml
+    - sed -i "s/<IMAGE_PULL_SECRET>/${secret_for_accessing_gitlab_registry}/g" eks-files/deployment.yaml
+    - sed -i "s/<SERVER_PORT>/${SERVER_PORT}/g" eks-files/service.yaml
+    - sed -i "s/<DB_USER>/${DB_USER}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_HOST>/${DB_HOST}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_PASSWORD>/${DB_PASSWORD}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_NAME>/${DB_NAME}/g" eks-files/configmap.yaml
+    - kubectl apply -f eks-files/configmap.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/service.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl rollout restart -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+
+dast:
+  stage: dast
+  only:
+    - master
+  image:
+    name: "$SECURE_ANALYZERS_PREFIX/dast:$DAST_VERSION"
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "DAST disabled= "$DAST_DISABLED  $DAST_DISABLED_FOR_DEFAULT_BRANCH   
+    - if [ -z "$DAST_WEBSITE$DAST_API_SPECIFICATION" ]; then echo "Either DAST_WEBSITE or DAST_API_SPECIFICATION must be set. See https://docs.gitlab.com/ee/user/application_security/dast/#configuration for more details." && exit 1; fi
+    - /analyze
+  artifacts:
+    reports:
+      dast: react-stub-dast-report.json
+
+
+deploy-to-test:
+  stage: deploy-to-test
+  image: dtzar/helm-kubectl
+  only:
+    - master
+  environment:
+    name: test
+  script:
+    - echo 'CI_ENVIRONMENT_NAME =' $CI_ENVIRONMENT_NAME
+    - kubectl config set-cluster k8s --server="${SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${USER_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab
+    - kubectl config use-context default
+    - kubectl create secret docker-registry ${secret_for_accessing_gitlab_registry} --docker-server=${CI_REGISTRY} --docker-username=${DOCKER_USER} --docker-password=${DOCKER_PASS} -n env-${CI_ENVIRONMENT_NAME} || true
+    - sed -i "s/<VERSION>/${CI_PIPELINE_IID}/g" eks-files/deployment.yaml
+    - sed -i "s/<IMAGE_PULL_SECRET>/${secret_for_accessing_gitlab_registry}/g" eks-files/deployment.yaml
+    - sed -i "s/<SERVER_PORT>/${SERVER_PORT}/g" eks-files/service.yaml
+    - sed -i "s/<DB_USER>/${DB_USER}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_HOST>/${DB_HOST}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_PASSWORD>/${DB_PASSWORD}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_NAME>/${DB_NAME}/g" eks-files/configmap.yaml
+    - kubectl apply -f eks-files/configmap.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/service.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl rollout restart -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+
+deploy-to-stage:
+  stage: deploy-to-stage
+  image: dtzar/helm-kubectl
+  when: manual
+  allow_failure: false
+  only:
+    - master
+  environment:
+    name: stage
+  script:
+    - echo 'CI_ENVIRONMENT_NAME =' $CI_ENVIRONMENT_NAME
+    - kubectl config set-cluster k8s --server="${SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${USER_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab
+    - kubectl config use-context default
+    - kubectl create secret docker-registry ${secret_for_accessing_gitlab_registry} --docker-server=${CI_REGISTRY} --docker-username=${DOCKER_USER} --docker-password=${DOCKER_PASS} -n env-${CI_ENVIRONMENT_NAME} || true
+    - sed -i "s/<VERSION>/${CI_PIPELINE_IID}/g" eks-files/deployment.yaml
+    - sed -i "s/<IMAGE_PULL_SECRET>/${secret_for_accessing_gitlab_registry}/g" eks-files/deployment.yaml
+    - sed -i "s/<SERVER_PORT>/${SERVER_PORT}/g" eks-files/service.yaml
+    - sed -i "s/<DB_USER>/${DB_USER}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_HOST>/${DB_HOST}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_PASSWORD>/${DB_PASSWORD}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_NAME>/${DB_NAME}/g" eks-files/configmap.yaml
+    - kubectl apply -f eks-files/configmap.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/service.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl rollout restart -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+
+deploy-to-prod:
+  stage: deploy-to-prod
+  image: dtzar/helm-kubectl
+  when: manual
+  allow_failure: false
+  only:
+    - master
+  environment:
+    name: prod
+  script:
+    - echo 'CI_ENVIRONMENT_NAME =' $CI_ENVIRONMENT_NAME
+    - kubectl config set-cluster k8s --server="${SERVER}"
+    - kubectl config set clusters.k8s.certificate-authority-data ${CERTIFICATE_AUTHORITY_DATA}
+    - kubectl config set-credentials gitlab --token="${USER_TOKEN}"
+    - kubectl config set-context default --cluster=k8s --user=gitlab
+    - kubectl config use-context default
+    - kubectl create secret docker-registry ${secret_for_accessing_gitlab_registry} --docker-server=${CI_REGISTRY} --docker-username=${DOCKER_USER} --docker-password=${DOCKER_PASS} -n env-${CI_ENVIRONMENT_NAME} || true
+    - sed -i "s/<VERSION>/${CI_PIPELINE_IID}/g" eks-files/deployment.yaml
+    - sed -i "s/<IMAGE_PULL_SECRET>/${secret_for_accessing_gitlab_registry}/g" eks-files/deployment.yaml
+    - sed -i "s/<SERVER_PORT>/${SERVER_PORT}/g" eks-files/service.yaml
+    - sed -i "s/<DB_USER>/${DB_USER}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_HOST>/${DB_HOST}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_PASSWORD>/${DB_PASSWORD}/g" eks-files/configmap.yaml
+    - sed -i "s/<DB_NAME>/${DB_NAME}/g" eks-files/configmap.yaml
+    - kubectl apply -f eks-files/configmap.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl apply -f eks-files/service.yaml -n env-${CI_ENVIRONMENT_NAME}
+    - kubectl rollout restart -f eks-files/deployment.yaml -n env-${CI_ENVIRONMENT_NAME}
